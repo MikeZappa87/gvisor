@@ -385,7 +385,7 @@ func TestInstallCompatDirSpecFiles(t *testing.T) {
 			Shares: &cpuShares,
 		},
 		Pids: &specs.LinuxPids{
-			Limit: pidsLimit,
+			Limit: &pidsLimit,
 		},
 	}
 	if err := cg.installCompatDir(res); err != nil {

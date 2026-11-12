@@ -693,7 +693,7 @@ func TestPids(t *testing.T) {
 	}{
 		{
 			name: "all",
-			spec: &specs.LinuxPids{Limit: 1},
+			spec: &specs.LinuxPids{Limit: int64Ptr(1)},
 			wants: map[string]string{
 				"pids.max": "1",
 			},
@@ -885,7 +885,7 @@ func TestOptional(t *testing.T) {
 			}{
 				{
 					name: "limit",
-					spec: &specs.LinuxResources{Pids: &specs.LinuxPids{Limit: 1}},
+					spec: &specs.LinuxResources{Pids: &specs.LinuxPids{Limit: int64Ptr(1)}},
 					err:  "Pids.Limit set but pids cgroup controller not found",
 				},
 			},

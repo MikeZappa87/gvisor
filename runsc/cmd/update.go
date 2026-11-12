@@ -235,7 +235,7 @@ func (u *Update) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcom
 		}
 
 		if u.pidsLimit > 0 {
-			r.Pids = &specs.LinuxPids{Limit: u.pidsLimit}
+			r.Pids = &specs.LinuxPids{Limit: &u.pidsLimit}
 		}
 	}
 

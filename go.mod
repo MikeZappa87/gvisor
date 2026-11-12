@@ -35,7 +35,7 @@ require (
 	github.com/mattbaird/jsonpatch v0.0.0-20171005235357-81af80346b1a
 	github.com/moby/sys/capability v0.4.0
 	github.com/mohae/deepcopy v0.0.0-20170308212314-bb9b5e7adda9
-	github.com/opencontainers/runtime-spec v1.2.1
+	github.com/opencontainers/runtime-spec v1.3.0
 	github.com/sirupsen/logrus v1.9.3
 	github.com/vishvananda/netlink v1.3.1-0.20250303224720-0e7078ed04c8
 	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc

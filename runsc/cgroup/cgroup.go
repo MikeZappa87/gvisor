@@ -1126,17 +1126,17 @@ func (*pids) optional() bool {
 }
 
 func (*pids) skip(spec *specs.LinuxResources) error {
-	if spec != nil && spec.Pids != nil && spec.Pids.Limit > 0 {
+	if spec != nil && spec.Pids != nil && spec.Pids.Limit != nil && *spec.Pids.Limit > 0 {
 		return fmt.Errorf("Pids.Limit set but pids cgroup controller not found")
 	}
 	return nil
 }
 
 func (*pids) set(spec *specs.LinuxResources, path string) error {
-	if spec == nil || spec.Pids == nil || spec.Pids.Limit <= 0 {
+	if spec == nil || spec.Pids == nil || spec.Pids.Limit == nil || *spec.Pids.Limit <= 0 {
 		return nil
 	}
-	val := strconv.FormatInt(spec.Pids.Limit, 10)
+	val := strconv.FormatInt(*spec.Pids.Limit, 10)
 	return setValue(path, "pids.max", val)
 }
 

@@ -31,6 +31,40 @@ var (
 `
 )
 
+func TestPidsV2(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pids       *specs.LinuxPids
+		want       string
+		properties int
+	}{
+		{name: "nil"},
+		{name: "unset", pids: &specs.LinuxPids{}},
+		{name: "set", pids: &specs.LinuxPids{Limit: int64Ptr(7)}, want: "7", properties: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "pids.max"), []byte("unchanged"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			spec := &specs.LinuxResources{Pids: tc.pids}
+			controller := &pid2{}
+			if err := controller.set(spec, dir); err != nil {
+				t.Fatalf("set: %v", err)
+			}
+			want := tc.want
+			if want == "" {
+				want = "unchanged"
+			}
+			checkDir(t, dir, map[string]string{"pids.max": want})
+			properties, err := controller.generateProperties(spec)
+			if err != nil || len(properties) != tc.properties {
+				t.Errorf("generateProperties = %v, %v; want %d properties", properties, err, tc.properties)
+			}
+		})
+	}
+}
+
 func TestIO(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
