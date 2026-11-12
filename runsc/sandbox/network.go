@@ -29,6 +29,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -59,6 +60,10 @@ import (
 //	docker run -di --runtime=runsc -p 8080:80 -v $PWD:/usr/local/apache2/htdocs/ httpd:2.4
 func (s *Sandbox) setupNetwork(conn *urpc.Client, pid int, spec *specs.Spec, conf *config.Config, disableIPv6 bool, isRestore bool) error {
 	log.Infof("Setting up network")
+	devices := networkDevices(spec)
+	if len(devices) != 0 && conf.Network != config.NetworkSandbox {
+		return fmt.Errorf("linux.netDevices requires sandbox networking, got %q", conf.Network)
+	}
 
 	var (
 		udsHost    *os.File
@@ -89,8 +94,19 @@ func (s *Sandbox) setupNetwork(conn *urpc.Client, pid int, spec *specs.Spec, con
 		// Build the path to the net namespace of the sandbox process.
 		// This is what we will copy.
 		nsPath := filepath.Join("/proc", strconv.Itoa(pid), "ns/net")
+		var interfaceNames []string
+		if len(devices) != 0 {
+			if conf.XDP.Mode == config.XDPModeRedirect || conf.XDP.Mode == config.XDPModeTunnel {
+				return fmt.Errorf("linux.netDevices is incompatible with XDP mode %q", conf.XDP.Mode)
+			}
+			var err error
+			interfaceNames, err = moveNetDevicesToNS(devices, nsPath)
+			if err != nil {
+				return fmt.Errorf("moving OCI network devices to namespace %q: %w", nsPath, err)
+			}
+		}
 		var err error
-		primaryMTU, err = createInterfacesAndRoutesFromNS(conn, nsPath, conf, disableIPv6, isRestore, udsSandbox)
+		primaryMTU, err = createInterfacesAndRoutesFromNS(conn, nsPath, conf, disableIPv6, isRestore, udsSandbox, interfaceNames)
 		if err != nil {
 			return fmt.Errorf("creating interfaces from net namespace %q: %v", nsPath, err)
 		}
@@ -122,6 +138,120 @@ const (
 	// known. It matches the conventional Ethernet MTU.
 	defaultMTU = 1500
 )
+
+type networkDevice struct {
+	sourceName string
+	targetName string
+}
+
+func networkDevices(spec *specs.Spec) []networkDevice {
+	if spec == nil || spec.Linux == nil || len(spec.Linux.NetDevices) == 0 {
+		return nil
+	}
+	devices := make([]networkDevice, 0, len(spec.Linux.NetDevices))
+	for sourceName, device := range spec.Linux.NetDevices {
+		targetName := device.Name
+		if targetName == "" {
+			targetName = sourceName
+		}
+		devices = append(devices, networkDevice{sourceName: sourceName, targetName: targetName})
+	}
+	slices.SortFunc(devices, func(a, b networkDevice) int {
+		return strings.Compare(a.sourceName, b.sourceName)
+	})
+	return devices
+}
+
+func moveNetDevicesToNS(devices []networkDevice, nsPath string) ([]string, error) {
+	if len(devices) == 0 {
+		return nil, nil
+	}
+	fixedNames := make(map[string]string, len(devices))
+	for _, device := range devices {
+		if strings.HasSuffix(device.targetName, "%d") {
+			continue
+		}
+		if sourceName, ok := fixedNames[device.targetName]; ok {
+			return nil, fmt.Errorf("interfaces %q and %q have the same target name %q", sourceName, device.sourceName, device.targetName)
+		}
+		fixedNames[device.targetName] = device.sourceName
+	}
+	restore, err := joinNetNS(nsPath)
+	if err != nil {
+		return nil, err
+	}
+	isRoot, rootErr := isRootNetNS()
+	restore()
+	if rootErr != nil {
+		return nil, rootErr
+	}
+	if isRoot {
+		return nil, errors.New("cannot move OCI network devices into the root network namespace")
+	}
+	for _, device := range devices {
+		if strings.HasSuffix(device.targetName, "%d") {
+			continue
+		}
+		if _, err := netlink.LinkByName(device.targetName); err == nil {
+			restore()
+			return nil, fmt.Errorf("network interface target name %q already exists", device.targetName)
+		} else {
+			var notFound netlink.LinkNotFoundError
+			if !errors.As(err, &notFound) {
+				restore()
+				return nil, fmt.Errorf("checking target interface name %q: %w", device.targetName, err)
+			}
+		}
+	}
+	restore()
+
+	nsFile, err := os.Open(nsPath)
+	if err != nil {
+		return nil, fmt.Errorf("opening target network namespace %q: %w", nsPath, err)
+	}
+	defer nsFile.Close()
+
+	links := make([]netlink.Link, 0, len(devices))
+	names := make([]string, 0, len(devices))
+	for _, device := range devices {
+		link, err := netlink.LinkByName(device.sourceName)
+		if err != nil {
+			return nil, fmt.Errorf("getting source interface %q: %w", device.sourceName, err)
+		}
+		links = append(links, link)
+	}
+	for i, device := range devices {
+		if err := netlink.LinkSetNsFd(links[i], int(nsFile.Fd())); err != nil {
+			return nil, fmt.Errorf("moving interface %q to network namespace: %w", device.sourceName, err)
+		}
+	}
+
+	restore, err = joinNetNS(nsPath)
+	if err != nil {
+		return nil, err
+	}
+	defer restore()
+	for _, device := range devices {
+		link, err := netlink.LinkByName(device.sourceName)
+		if err != nil {
+			return nil, fmt.Errorf("getting moved interface %q: %w", device.sourceName, err)
+		}
+		if device.targetName != device.sourceName {
+			if err := netlink.LinkSetName(link, device.targetName); err != nil {
+				return nil, fmt.Errorf("renaming interface %q to %q: %w", device.sourceName, device.targetName, err)
+			}
+		}
+		if err := netlink.LinkSetUp(link); err != nil {
+			return nil, fmt.Errorf("bringing interface %q up: %w", device.targetName, err)
+		}
+		link, err = netlink.LinkByIndex(link.Attrs().Index)
+		if err != nil {
+			return nil, fmt.Errorf("getting renamed interface %q: %w", device.targetName, err)
+		}
+		names = append(names, link.Attrs().Name)
+	}
+	return names, nil
+}
 
 // hasFDBasedLink reports whether args.FDBasedLinks contains a link with the
 // given interface name.
@@ -326,8 +456,21 @@ func removeLinkAddresses(linkName string, addresses []sentryapi.IPWithPrefix) er
 // namespace and scrapes their configuration (addresses, routes, neighbors).
 // It returns the args to create them in the sandbox. This function has no
 // side effects on the interfaces themselves.
-func collectLinksAndRoutes(conf *config.Config, disableIPv6 bool) (sentryapi.CreateLinksAndRoutesArgs, error) {
-	ifaces, err := net.Interfaces()
+func collectLinksAndRoutes(conf *config.Config, disableIPv6 bool, interfaceNames ...string) (sentryapi.CreateLinksAndRoutesArgs, error) {
+	var ifaces []net.Interface
+	var err error
+	if len(interfaceNames) == 0 {
+		ifaces, err = net.Interfaces()
+	} else {
+		ifaces = make([]net.Interface, 0, len(interfaceNames))
+		for _, name := range interfaceNames {
+			link, linkErr := netlink.LinkByName(name)
+			if linkErr != nil {
+				return sentryapi.CreateLinksAndRoutesArgs{}, fmt.Errorf("querying interface %q: %w", name, linkErr)
+			}
+			ifaces = append(ifaces, netInterfaceFromLink(link))
+		}
+	}
 	if err != nil {
 		return sentryapi.CreateLinksAndRoutesArgs{}, fmt.Errorf("querying interfaces: %w", err)
 	}
@@ -371,7 +514,7 @@ func collectLinksAndRoutes(conf *config.Config, disableIPv6 bool) (sentryapi.Cre
 			}
 			ipAddrs = append(ipAddrs, ipNet)
 		}
-		if len(ipAddrs) == 0 {
+		if len(ipAddrs) == 0 && len(interfaceNames) == 0 {
 			log.Warningf("No usable IP addresses found for interface %q, skipping", iface.Name)
 			continue
 		}
@@ -471,10 +614,29 @@ func collectLinksAndRoutes(conf *config.Config, disableIPv6 bool) (sentryapi.Cre
 	return args, nil
 }
 
+func netInterfaceFromLink(link netlink.Link) net.Interface {
+	attrs := link.Attrs()
+	return net.Interface{
+		Index:        attrs.Index,
+		MTU:          attrs.MTU,
+		Name:         attrs.Name,
+		HardwareAddr: attrs.HardwareAddr,
+		Flags:        attrs.Flags,
+	}
+}
+
+func netInterfaceByName(name string) (net.Interface, error) {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return net.Interface{}, err
+	}
+	return netInterfaceFromLink(link), nil
+}
+
 // createInterfacesAndRoutesFromNS scrapes the interface and routes from the
 // net namespace with the given path, creates them in the sandbox, and removes
 // them from the host.
-func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *config.Config, disableIPv6 bool, isRestore bool, udsFile *os.File) (int, error) {
+func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *config.Config, disableIPv6 bool, isRestore bool, udsFile *os.File, interfaceNames []string) (int, error) {
 	switch conf.XDP.Mode {
 	case config.XDPModeOff:
 	case config.XDPModeNS:
@@ -508,7 +670,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 	}
 
 	// Collect addresses and routes from the interfaces.
-	args, err := collectLinksAndRoutes(conf, disableIPv6)
+	args, err := collectLinksAndRoutes(conf, disableIPv6, interfaceNames...)
 	if err != nil {
 		return 0, err
 	}
@@ -549,11 +711,11 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 
 	for i := range args.XDPLinks {
 		link := &args.XDPLinks[i]
-		iface, err := net.InterfaceByName(link.Name)
+			iface, err := netInterfaceByName(link.Name)
 		if err != nil {
 			return 0, fmt.Errorf("getting interface by name %q: %w", link.Name, err)
 		}
-		xdpSockFDs, err := createSocketXDP(*iface)
+			xdpSockFDs, err := createSocketXDP(iface)
 		if err != nil {
 			return 0, fmt.Errorf("failed to create XDP socket: %v", err)
 		}
@@ -568,7 +730,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 			primaryMTU = link.MTU
 			args.FilePayload.Files = append(args.FilePayload.Files, udsFile)
 		} else {
-			iface, err := net.InterfaceByName(link.Name)
+			iface, err := netInterfaceByName(link.Name)
 			if err != nil {
 				return 0, fmt.Errorf("getting interface by name %q: %w", link.Name, err)
 			}
@@ -581,7 +743,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 			// Create the socket for the device.
 			for j := 0; j < link.NumChannels; j++ {
 				log.Debugf("Creating Channel %d", j)
-				socketEntry, err := createSocket(*iface, ifaceLink, conf.HostGSO)
+				socketEntry, err := createSocket(iface, ifaceLink, conf.HostGSO)
 				if err != nil {
 					return 0, fmt.Errorf("failed to createSocket for %s : %w", link.Name, err)
 				}

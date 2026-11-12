@@ -21,10 +21,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
@@ -320,6 +324,21 @@ func defaultLoopbackLinks() []sentryapi.LoopbackLink {
 	}
 }
 
+func TestNetworkDevices(t *testing.T) {
+	spec := &specs.Spec{Linux: &specs.Linux{NetDevices: map[string]specs.LinuxNetDevice{
+		"host1": {Name: "container1"},
+		"host0": {},
+	}}}
+	got := networkDevices(spec)
+	want := []networkDevice{
+		{sourceName: "host0", targetName: "host0"},
+		{sourceName: "host1", targetName: "container1"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("networkDevices() = %+v, want %+v", got, want)
+	}
+}
+
 func TestCollectLinksAndRoutes_Multicast(t *testing.T) {
 	requireRoot(t)
 	for _, test := range []struct {
@@ -373,6 +392,144 @@ func TestCollectLinksAndRoutes_Multicast(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCollectLinksAndRoutes_SelectedInterfaceWithoutAddress(t *testing.T) {
+	requireRoot(t)
+	setupTestNamespace(t)
+	selected := createVethPair(t, "testveth0")
+	if err := netlink.LinkSetUp(selected); err != nil {
+		t.Fatalf("LinkSetUp(selected): %v", err)
+	}
+	other := createVethPair(t, "testveth1")
+	if err := netlink.LinkSetUp(other); err != nil {
+		t.Fatalf("LinkSetUp(other): %v", err)
+	}
+
+	args, err := collectLinksAndRoutes(&config.Config{}, false, "testveth0")
+	if err != nil {
+		t.Fatalf("collectLinksAndRoutes(selected): %v", err)
+	}
+	if got, want := len(args.FDBasedLinks), 1; got != want {
+		t.Fatalf("len(FDBasedLinks) = %d, want %d; links = %+v", got, want, args.FDBasedLinks)
+	}
+	if got := args.FDBasedLinks[0].Name; got != "testveth0" {
+		t.Errorf("selected interface name = %q, want testveth0", got)
+	}
+	if got := len(args.FDBasedLinks[0].Addresses); got != 0 {
+		t.Errorf("selected interface has %d addresses, want none", got)
+	}
+}
+
+func TestMoveNetDevicesToNS(t *testing.T) {
+	requireRoot(t)
+
+	veth := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: "hostveth"},
+		PeerName:  "hostvethpeer",
+	}
+	if err := netlink.LinkAdd(veth); err != nil {
+		t.Fatalf("LinkAdd(veth): %v", err)
+	}
+	t.Cleanup(func() {
+		peer, err := netlink.LinkByName("hostvethpeer")
+		if err == nil {
+			if err := netlink.LinkDel(peer); err != nil {
+				t.Errorf("LinkDel(peer): %v", err)
+			}
+		}
+	})
+
+	type targetNamespace struct {
+		path string
+		err  error
+	}
+	ready := make(chan targetNamespace, 1)
+	stop := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer close(finished)
+		if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+			runtime.UnlockOSThread()
+			ready <- targetNamespace{err: err}
+			return
+		}
+		path := "/proc/" + strconv.Itoa(os.Getpid()) + "/task/" + strconv.Itoa(unix.Gettid()) + "/ns/net"
+		ready <- targetNamespace{path: path}
+		<-stop
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		<-finished
+	})
+	target := <-ready
+	if target.err != nil {
+		t.Skipf("cannot create target network namespace: %v", target.err)
+	}
+
+	names, err := moveNetDevicesToNS([]networkDevice{{sourceName: "hostveth", targetName: "containereth%d"}}, target.path)
+	if err != nil {
+		t.Fatalf("moveNetDevicesToNS: %v", err)
+	}
+	if len(names) != 1 || !strings.HasPrefix(names[0], "containereth") || strings.Contains(names[0], "%") {
+		t.Fatalf("moveNetDevicesToNS names = %v, want a kernel-assigned containereth name", names)
+	}
+	func() {
+		restore, err := joinNetNS(target.path)
+		if err != nil {
+			t.Fatalf("joinNetNS: %v", err)
+		}
+		defer restore()
+		link, err := netlink.LinkByName(names[0])
+		if err != nil {
+			t.Fatalf("LinkByName(%q): %v", names[0], err)
+		}
+		if link.Attrs().Flags&net.FlagUp == 0 {
+			t.Error("moved interface is down")
+		}
+	}()
+
+	fixed := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: "hostveth2"},
+		PeerName:  "hostveth2peer",
+	}
+	if err := netlink.LinkAdd(fixed); err != nil {
+		t.Fatalf("LinkAdd(fixed): %v", err)
+	}
+	t.Cleanup(func() {
+		peer, err := netlink.LinkByName("hostveth2peer")
+		if err == nil {
+			if err := netlink.LinkDel(peer); err != nil {
+				t.Errorf("LinkDel(fixed peer): %v", err)
+			}
+		}
+	})
+	if _, err := moveNetDevicesToNS([]networkDevice{{sourceName: "hostveth2", targetName: "containerfixed0"}}, target.path); err != nil {
+		t.Fatalf("moveNetDevicesToNS with a free fixed name: %v", err)
+	}
+
+	conflict := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: "hostveth3"},
+		PeerName:  "hostveth3peer",
+	}
+	if err := netlink.LinkAdd(conflict); err != nil {
+		t.Fatalf("LinkAdd(conflict): %v", err)
+	}
+	t.Cleanup(func() {
+		peer, err := netlink.LinkByName("hostveth3peer")
+		if err == nil {
+			if err := netlink.LinkDel(peer); err != nil {
+				t.Errorf("LinkDel(conflict peer): %v", err)
+			}
+		}
+	})
+	if _, err := moveNetDevicesToNS([]networkDevice{{sourceName: "hostveth3", targetName: "lo"}}, target.path); err == nil {
+		t.Fatal("moveNetDevicesToNS with an occupied target name succeeded")
+	}
+	if _, err := netlink.LinkByName("hostveth3"); err != nil {
+		t.Errorf("source interface was moved despite target-name conflict: %v", err)
 	}
 }
 
